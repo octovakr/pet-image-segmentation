@@ -1,0 +1,120 @@
+Competition Rules
+1. Task
+3-class semantic segmentation on pet images. Each pixel must be classified as one of:
+
+0 = Foreground (animal body)
+1 = Background
+2 = Boundary (thin contour around the animal)
+You will be evaluated on a held-out set of 244 test images covering pets and out-of-distribution animal categories.
+
+2. Allowed Architectures
+U-Net family only. Standard U-Net, U-Net with custom encoders/decoders, U-Net++, attention U-Net, residual U-Net, etc. are all allowed as long as the overall encoder–decoder + skip-connection architecture is preserved.
+Encoder backbones from torchvision (ResNet, EfficientNet, VGG, etc.) initialized with ImageNet classification pretrained weights are allowed.
+
+3. Forbidden
+The following are not allowed under any circumstances:
+
+❌ Segmentation foundation models (SAM, SAM2, Mask2Former, OneFormer, MaskFormer, SegFormer, etc.)
+❌ Vision-language pretrained encoders (CLIP, DINO, DINOv2, BEiT, MAE, etc.)
+❌ Any pretrained weights other than ImageNet classification weights
+❌ External segmentation datasets (COCO, ADE20K, Pascal VOC, Cityscapes, LVIS, etc.)
+❌ External pet/animal datasets beyond Oxford-IIIT Pet
+❌ Test-time use of any pretrained segmentation model (e.g. running SAM on test images and using its output)
+
+4. Training Data
+✅ You may use the entire Oxford-IIIT Pet dataset freely (both trainval.txt and test.txt splits, totaling ~7,349 images). How you create your own train/validation split inside this pool is up to you.
+✅ Standard data augmentation (flip, rotation, color jitter, random crop, etc.) is allowed.
+
+5. Compute Constraint
+Models must be trainable on a single NVIDIA RTX 3090 (24GB VRAM) within a reasonable time. Submissions whose architectures cannot run on a single 3090 will be considered violations.
+A single RTX 3090 GPU will be provided to each participant via VESSL. Use that environment for training and inference.
+Total training wall-clock time is not strictly enforced, but should be feasible (under ~6 hours on a 3090 is recommended).
+
+6. Evaluation
+Metric: Mean Intersection-over-Union (mIoU) averaged across the 3 classes (foreground, background, boundary).
+Test set: 244 held-out images. Ground truth labels are not released.
+The test set includes both in-distribution (cats, dogs) and out-of-distribution animal categories.
+Public Leaderboard: ~50% of the test set. Score is shown immediately after each submission.
+Private Leaderboard: ~50% of the test set. Score is revealed only after the competition ends and determines final rankings.
+You will not know which images belong to public vs. private split.
+
+7. Label Convention (⚠️ Important)
+The label convention used for submission differs from the raw Oxford-IIIT trimap files. Please read carefully.
+
+Our submission convention
+Class ID	Meaning
+0	Foreground (animal body)
+1	Background
+2	Boundary
+Oxford-IIIT trimap PNGs
+The raw trimap PNG files in annotations/trimaps/*.png use a different convention:
+
+Pixel value in PNG	Meaning
+1	Foreground
+2	Background
+3	Boundary
+Required remapping
+When training, you must remap the IIIT trimap labels to match the submission convention. This is simply subtract 1:
+
+# IIIT trimap value -> submission class id
+# 1 (fg)        -> 0
+# 2 (bg)        -> 1
+# 3 (boundary)  -> 2
+mask = (trimap_array.astype(np.int16) - 1).clip(0, 2).astype(np.uint8)
+If you submit predictions with values {1, 2, 3} instead of {0, 1, 2}, your mIoU will be near zero. Always verify with np.unique(your_prediction) that values are in {0, 1, 2} before submission.
+
+8. Submission Format
+Submit a single CSV file with the following columns:
+
+id,height,width,rle
+cat_0000,284,250,<rle string>
+hamster_0040,1024,1536,<rle string>
+...
+One row per test image (244 rows total, plus header).
+rle column: multiclass run-length encoding of the prediction mask, in row-major order.
+Format: value length value length ... where each (value, length) pair represents a run of identical class labels in the flattened mask.
+Example: a 2×5 mask [[0,0,1,1,2],[2,2,0,0,0]] becomes "0 2 1 2 2 3 0 3".
+A sample_submission.csv template is provided. In addition, a starter script that converts your model predictions into the required submission.csv format will be provided. You are not expected to implement RLE encoding from scratch — use the provided code.
+
+9. Submission Limits
+Daily submission limit: 5 per day, per participant.
+Total submission limit: 15
+Final submissions: At the end of the competition, you must select 2 submissions to be scored on the Private Leaderboard. If you do not select any, your last 2 submissions will be used by default.
+
+10. Team Policy
+This is an individual project. Maximum team size is 1.
+Sharing code, models, or predictions with other participants is not allowed.
+
+11. External Code & AI Assistants
+✅ Open-source U-Net implementations (e.g. pytorch-segmentation, segmentation_models_pytorch) may be used.
+✅ You may use code from public tutorials, blog posts, GitHub repos, etc.
+✅ AI assistants (Claude, ChatGPT, GitHub Copilot, Gemini, etc.) may be used freely for coding help, debugging, and ideation.
+⚠️ You must cite all external code and AI assistance in your final report. Failure to cite is academic misconduct.
+
+12. Reproducibility
+You may be asked to share your training code, model weights, and a brief description of your method after the competition ends.
+Set a fixed random seed and log your training config for reproducibility.
+
+13. Academic Integrity
+All submissions must be your own work.
+Use of any forbidden architecture, dataset, or pretrained weights (Section 3) will result in disqualification.
+The instructor reserves the right to inspect submitted code and request explanations.
+
+14. Final Deliverables
+You must submit two sets of artifacts to be considered for grading.
+
+Kaggle (during the competition)
+submission.csv files via the Kaggle competition page.
+At the deadline, select 2 final submissions to be scored on the Private Leaderboard.
+LearnUS (by the deadline)
+Source code (training + inference scripts), as a single zip file. Must be runnable end-to-end.
+Final submission.csv matching one of your selected Kaggle submissions (for verification).
+Report PDF describing your method, experiments, and citations of any external code or AI assistance used.
+(Optional) Trained model weights, if you want the instructor to verify reproducibility.
+⚠️ Failure to submit to LearnUS will result in disqualification, even if your Kaggle Leaderboard score is high. The instructor will inspect the LearnUS submission to verify rule compliance (especially Sections 2 and 3 — allowed/forbidden architectures and pretrained weights).
+
+15. Timeline
+Competition start: 2026-04-29, 17:00 KST
+Submission deadline: 2026-05-31, 23:59 KST
+Private Leaderboard release: 2026-05-31, 23:59 KST (immediately after submission deadline)
+Final results announcement: within ~7 days after deadline
