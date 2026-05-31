@@ -1,0 +1,298 @@
+import os
+import argparse
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import segmentation_models_pytorch as smp
+from pathlib import Path
+from PIL import Image
+from torchvision.transforms import v2
+
+from data import train_loader, val_loader
+
+
+# ── 모델 ──────────────────────────────────────────────────────
+class UNet(nn.Module):
+    """UNet++ with EfficientNet-B4 encoder (ImageNet pretrained).
+    decoder_dropout=0.3 으로 overfitting 억제.
+    """
+
+    def __init__(self, in_channels: int = 3, num_classes: int = 3):
+        super().__init__()
+        self.model = smp.UnetPlusPlus(
+            encoder_name='efficientnet-b4',
+            encoder_weights='imagenet',
+            in_channels=in_channels,
+            classes=num_classes,
+            decoder_dropout=0.3,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+
+# ── 손실 함수 ─────────────────────────────────────────────────
+class SegmentationLoss(nn.Module):
+    """Combo Loss: DiceLoss(0.5) + CrossEntropyLoss(0.5).
+    얇은 boundary 윤곽은 픽셀 단위 CE에 더 민감하므로 CE 비중을 0.5로 유지.
+    CE weight=[1,1,2.0]로 boundary 클래스를 강조해 macro mIoU 병목을 완화.
+    """
+
+    def __init__(self, device: torch.device):
+        super().__init__()
+        self.dice = smp.losses.DiceLoss(mode='multiclass')
+        weight    = torch.tensor([1.0, 1.0, 2.0], device=device)
+        self.ce   = nn.CrossEntropyLoss(weight=weight)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # logits : (B, C, H, W)  targets : (B, H, W) LongTensor
+        return 0.5 * self.dice(logits, targets) + 0.5 * self.ce(logits, targets)
+
+
+# ── Trainer ───────────────────────────────────────────────────
+class Trainer:
+    """AMP + gradient clipping 이 적용된 train / validate 루프 래퍼."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        criterion: nn.Module,
+        optimizer: optim.Optimizer,
+        device: torch.device,
+    ):
+        self.model     = model
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.device    = device
+        self.scaler    = torch.cuda.amp.GradScaler()
+
+    def train_one_epoch(self, loader) -> float:
+        self.model.train()
+        total_loss = 0.0
+
+        for images, masks in loader:
+            images = images.to(self.device)
+            masks  = masks.to(self.device)
+
+            self.optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
+                logits = self.model(images)          # (B, C, H, W)
+                loss   = self.criterion(logits, masks)
+
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            total_loss += loss.item()
+
+        return total_loss / len(loader)
+
+    @torch.no_grad()
+    def validate(self, loader, num_classes: int = 3):
+        """배치 평균 loss 와 macro-averaged mIoU 를 반환합니다."""
+        self.model.eval()
+        total_loss = 0.0
+        # 클래스별 intersection / union 누적
+        inter = torch.zeros(num_classes, device=self.device)
+        union = torch.zeros(num_classes, device=self.device)
+
+        for images, masks in loader:
+            images = images.to(self.device)
+            masks  = masks.to(self.device)
+
+            with torch.cuda.amp.autocast():
+                logits = self.model(images)
+                loss   = self.criterion(logits, masks)
+            total_loss += loss.item()
+
+            preds = logits.argmax(dim=1)          # (B, H, W)
+            for c in range(num_classes):
+                pred_c = preds == c
+                mask_c = masks == c
+                inter[c] += (pred_c & mask_c).sum()
+                union[c] += (pred_c | mask_c).sum()
+
+        iou_per_class = (inter / (union + 1e-6))
+        miou = iou_per_class.mean().item()
+        return total_loss / len(loader), miou, iou_per_class.cpu().tolist()
+
+
+# ── 추론 ──────────────────────────────────────────────────────
+# 테스트 이미지에 적용할 전처리 (augmentation 없음)
+_infer_transform = v2.Compose([
+    v2.ToImage(),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+
+# 멀티스케일 TTA에 사용할 입력 해상도 (학습 해상도 384 + 확대 스케일 512)
+_TTA_SCALES = (384, 512)
+
+
+@torch.no_grad()
+def predict(model: nn.Module, img_path: Path, device: torch.device) -> np.ndarray:
+    """
+    단일 이미지를 읽어 원본 해상도의 uint8 segmentation mask (값: 0,1,2) 를 반환합니다.
+
+    - 멀티스케일 TTA: {384, 512} 각 스케일에서 (원본 + 수평 반전) softmax 확률을 추론
+    - 각 스케일의 확률을 원본 H×W 로 bilinear 업샘플 후 모두 평균 (boundary 정렬 개선)
+    - 평균 확률에 argmax 하여 최종 class ID 산출
+    """
+    img_pil  = Image.open(img_path).convert('RGB')
+    orig_w, orig_h = img_pil.size                        # PIL: (W, H)
+
+    prob_accum = None                                    # (1, C, orig_h, orig_w) 누적 확률
+
+    with torch.cuda.amp.autocast():
+        for size in _TTA_SCALES:
+            resized  = img_pil.resize((size, size), Image.BILINEAR)
+            inp      = _infer_transform(resized).unsqueeze(0).to(device)  # (1,3,size,size)
+
+            inp_flip      = torch.flip(inp, dims=[-1])
+            prob_orig     = torch.softmax(model(inp), dim=1)
+            prob_flip_raw = torch.softmax(model(inp_flip), dim=1)
+            # 반전 공간의 확률을 원본 방향으로 되돌린 뒤 flip 쌍 평균
+            probs         = (prob_orig + torch.flip(prob_flip_raw, dims=[-1])) / 2
+
+            # 원본 해상도로 bilinear 업샘플하여 스케일 간 정렬 후 누적
+            probs_full = torch.nn.functional.interpolate(
+                probs, size=(orig_h, orig_w), mode='bilinear', align_corners=False
+            )
+            prob_accum = probs_full if prob_accum is None else prob_accum + probs_full
+
+    prob_accum = prob_accum / len(_TTA_SCALES)
+
+    # argmax를 통해 최종 class ID (0: FG, 1: BG, 2: Boundary) 추출
+    pred = prob_accum.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+    return pred                                          # (H, W), values in {0,1,2}
+
+
+def run_inference(ckpt_path: str, test_dir: str, pred_dir: str, device: torch.device):
+    """best_model.pth 를 불러와 test_images/ 전체를 추론하고 pred_dir 에 .npy 저장."""
+    model = UNet(in_channels=3, num_classes=3).to(device)
+    ckpt  = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.eval()
+    print(f"Loaded checkpoint: {ckpt_path}  (epoch {ckpt['epoch']}, "
+          f"val_loss={ckpt['val_loss']:.4f})")
+
+    pred_path = Path(pred_dir)
+    pred_path.mkdir(parents=True, exist_ok=True)
+
+    test_images = sorted(Path(test_dir).glob('*.jpg'))
+    print(f"Predicting {len(test_images)} test images → {pred_dir}/")
+
+    for img_path in test_images:
+        mask = predict(model, img_path, device)
+        out_file = pred_path / f"{img_path.stem}.npy"
+        np.save(out_file, mask)
+
+    print("Done. Unique label values in last prediction:", np.unique(mask))
+
+
+# ── main ──────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="Train U-Net or run inference")
+    parser.add_argument('--infer', action='store_true',
+                        help='학습 없이 추론만 실행 (best_model.pth 필요)')
+    parser.add_argument('--ckpt',      default='best_model.pth')
+    parser.add_argument('--test_dir',  default='test_images')
+    parser.add_argument('--pred_dir',  default='predictions')
+    parser.add_argument('--sample',  default='sample_submission.csv',
+                        help='make_submission.py 에 전달할 sample CSV 경로 (안내용)')
+    parser.add_argument('--out_csv', default='submission.csv',
+                        help='make_submission.py 에 전달할 출력 CSV 경로 (안내용)')
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # ── 추론 전용 모드 ─────────────────────────────────────────
+    if args.infer:
+        run_inference(args.ckpt, args.test_dir, args.pred_dir, device)
+        import subprocess, sys
+        subprocess.run([
+            sys.executable, "make_submission.py",
+            "--pred_dir", args.pred_dir,
+            "--sample",   args.sample,
+            "--out",      args.out_csv,
+        ], check=True)
+        return
+
+    # ── 학습 모드 ─────────────────────────────────────────────
+    num_epochs    = 40
+    learning_rate = 2e-4
+    num_classes   = 3
+    warmup_epochs = 5
+    es_patience   = 10   # early stopping patience
+
+    model     = UNet(in_channels=3, num_classes=num_classes).to(device)
+    criterion = SegmentationLoss(device)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+
+    # 5 epoch linear warmup → cosine decay (T_max = num_epochs - warmup_epochs = 35)
+    warmup_sched = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, total_iters=warmup_epochs
+    )
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-6
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs]
+    )
+
+    trainer        = Trainer(model, criterion, optimizer, device)
+    best_val_miou  = 0.0
+    es_counter     = 0
+
+    for epoch in range(1, num_epochs + 1):
+        train_loss                    = trainer.train_one_epoch(train_loader)
+        val_loss, val_miou, val_ious  = trainer.validate(val_loader, num_classes=num_classes)
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"[Epoch {epoch:02d}/{num_epochs}] "
+              f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+              f"val_mIoU={val_miou:.4f}  lr={current_lr:.2e}")
+        # 클래스별 IoU (0: FG, 1: BG, 2: Boundary) — boundary 병목 진단용
+        print(f"           IoU  FG={val_ious[0]:.4f}  BG={val_ious[1]:.4f}  "
+              f"Boundary={val_ious[2]:.4f}")
+
+        if val_miou > best_val_miou:
+            best_val_miou = val_miou
+            es_counter    = 0
+            torch.save({
+                'epoch':                epoch,
+                'model_state_dict':     model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss':             val_loss,
+                'val_miou':             best_val_miou,
+            }, args.ckpt)
+            print(f"  → Best checkpoint saved (val_mIoU={best_val_miou:.4f})")
+        else:
+            es_counter += 1
+            if es_counter >= es_patience:
+                print(f"  → Early stopping triggered (no improvement for {es_patience} epochs)")
+                break
+
+    print(f"\nTraining complete. Best val_mIoU={best_val_miou:.4f}  →  {args.ckpt}")
+
+    # 학습 직후 추론 → predictions/ 에 .npy 저장
+    run_inference(args.ckpt, args.test_dir, args.pred_dir, device)
+
+    # submission.csv 자동 생성
+    import subprocess, sys
+    subprocess.run([
+        sys.executable, "make_submission.py",
+        "--pred_dir", args.pred_dir,
+        "--sample",   args.sample,
+        "--out",      args.out_csv,
+    ], check=True)
+
+
+if __name__ == "__main__":
+    main()
