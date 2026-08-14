@@ -1,6 +1,6 @@
 ## Project Summary
 
-Codes to train pet-image tri-class segmentation model and generate submission file
+Codes for training pet-image tri-class segmentation model and generating submission file
 (Yonsei 2026 Spring, CAS3120 MACHINE LEARNING Programming Assignment)
 
 ## Main files
